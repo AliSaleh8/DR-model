@@ -1,0 +1,6 @@
+outs:
+- md5: de1aaf7580491f6a83490e3f5e5ecafc.dir
+  size: 3051046872
+  nfiles: 115241
+  hash: md5
+  path: train_binary
