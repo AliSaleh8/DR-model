@@ -1,28 +1,75 @@
 import torch
 import matplotlib.pyplot as plt
-from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+from sklearn.metrics import confusion_matrix,classification_report, ConfusionMatrixDisplay
 import json
 from torchvision import transforms as T
 from PIL import Image
 import random
 import numpy as np
 import cv2
-from sklearn.metrics import classification_report
+import mlflow
+import tempfile
+import os
+from mlflow.tracking import MlflowClient
+
+def get_start_epoch(model_accuracy_dict):
+    return len(model_accuracy_dict["metrics"]["train_acc"])
 
 
+def start_mlflow_run(
+    experiment_name,
+    model,
+    optimizer,
+    criterion,
+    start_epoch,
+    epochs,
+):
+    mlflow.set_experiment(experiment_name)
+
+    run = mlflow.start_run(
+        run_name=f"{experiment_name}_epochs_{start_epoch}_to_{start_epoch + epochs - 1}"
+    )
+
+    # Static metadata (log ONCE per run)
+    mlflow.log_param("model_type", model.__class__.__name__)
+    mlflow.log_param("criterion", criterion.__class__.__name__)
+    mlflow.log_param("optimizer", optimizer.__class__.__name__)
+
+    mlflow.log_param("start_epoch", start_epoch)
+    mlflow.log_param("end_epoch", start_epoch + epochs - 1)
+
+    # Optimizer static params
+    mlflow.log_param("weight_decay", optimizer.defaults.get("weight_decay", None))
+
+    # Tags for lineage
+    mlflow.set_tag("training_mode", "incremental")
+    mlflow.set_tag("model_family", experiment_name.split("_")[1])
+    mlflow.set_tag("task", experiment_name.split("_")[-1])
+
+    return run
 
 
-def model_inference(model,train_loader,val_loader,epochs,optimizer,criterion,best_path,save_path,device,best_accuracy=None):
+def model_inference(experiment_name,model,train_loader,val_loader,epochs,optimizer,criterion,
+                    best_path,save_path,device,model_accuracy_dict,model_dict_path):
 
+    start_epoch = get_start_epoch(model_accuracy_dict)
+    best_acc = max(model_accuracy_dict["metrics"]["val_acc"]) \
+        if model_accuracy_dict["metrics"]["val_acc"] else 0.0
+
+    run = start_mlflow_run(
+        experiment_name=experiment_name,
+        model=model,
+        optimizer=optimizer,
+        criterion=criterion,
+        start_epoch=start_epoch,
+        epochs=epochs,
+    )
 
     running_loss=0.0
-    train_accuracy=[]
-    val_accuracy=[]
-    best_acc=0.0 if best_accuracy is None else best_accuracy
+  
 
-
-
-    for epoch in range(epochs):
+    for local_epoch in range(epochs):
+        global_epoch = start_epoch + local_epoch
 
         total=0
         correct=0
@@ -49,14 +96,34 @@ def model_inference(model,train_loader,val_loader,epochs,optimizer,criterion,bes
             total+=labels.size(0)
 
             if i%100==99:
-                print('[%d,%5d] loss: %.3f'%(epoch+1,i+1,running_loss/100))
+                print('[%d,%5d] loss: %.3f'%(local_epoch+1,i+1,running_loss/100))
                 running_loss=0.0
 
-        accuracy=correct/total
-        print('Train Accuracy: %.3f'%accuracy)
-        train_accuracy.append(accuracy)
-        torch.save(model.state_dict(),save_path)
+        train_acc=correct/total
+        print('Train Accuracy: %.3f'%train_acc)
+        model_accuracy_dict["metrics"]["train_acc"].append(train_acc)
 
+        mlflow.log_metric("train_accuracy", train_acc, step=global_epoch)
+        for i, group in enumerate(optimizer.param_groups):
+            mlflow.log_metric(
+                f"lr_group_{i}",
+                group["lr"],
+                step=global_epoch
+            )
+            
+        torch.save(model.state_dict(),save_path)
+       
+        with tempfile.TemporaryDirectory() as tmpdir:
+            epoch_model_path = os.path.join(
+                tmpdir, f"model_epoch_{global_epoch}.pth"
+            )
+
+            torch.save(model.state_dict(), epoch_model_path)
+
+            mlflow.log_artifact(
+                epoch_model_path,
+                artifact_path="epoch_models"
+            )
         model.eval()
 
         total=0
@@ -78,15 +145,71 @@ def model_inference(model,train_loader,val_loader,epochs,optimizer,criterion,bes
             predicted_list.extend(predicted.cpu().numpy())
             labels_list.extend(labels.cpu().numpy())
 
-        accuracy=correct/total
-        print('Validation Accuracy: %.3f'%accuracy)
-        val_accuracy.append(accuracy)
+        val_acc = correct / total
+        print('Validation Accuracy: %.3f'%val_acc)
+
+        model_accuracy_dict["metrics"]["val_acc"].append(val_acc)
+        mlflow.log_metric("val_accuracy", val_acc, step=global_epoch)
 
 
-        if accuracy>best_acc:
-            best_acc=accuracy
-            torch.save(model.state_dict(),best_path)
-            print('Model saved with accuracy: %.3f'%best_acc)
+        if val_acc > best_acc:
+
+            if model_accuracy_dict["mode"] == "Transfer_learning":
+                Registered_model_name = "DR_Transfer_Classifier"
+            elif model_accuracy_dict["mode"] == "Binary_cls":
+                Registered_model_name = "DR_Binary_Classifier"
+
+            best_acc = val_acc
+            torch.save(model.state_dict(), best_path)
+            print(f"Model saved with accuracy: {best_acc:.3f}")
+
+            # 1️⃣ Log ONLY the weights
+            mlflow.log_artifact(best_path, artifact_path="weights")
+
+            client = MlflowClient()
+            run_id = mlflow.active_run().info.run_id
+
+            # 2️⃣ Register weights as a new model version
+            model_uri = f"runs:/{run_id}/weights/{os.path.basename(best_path)}"
+            mv = client.create_model_version(
+                name=Registered_model_name,
+                source=model_uri,
+                run_id=run_id
+            )
+            new_version = mv.version
+
+            # 3️⃣ Archive previous Production model (if exists)
+            for mv in client.search_model_versions(f"name='{Registered_model_name}'"):
+                if mv.current_stage == "Production":
+                    client.transition_model_version_stage(
+                        name=Registered_model_name,
+                        version=mv.version,
+                        stage="Archived"
+                    )
+
+            # 4️⃣ Promote new model to Production
+            client.transition_model_version_stage(
+                name=Registered_model_name,
+                version=new_version,
+                stage="Production"
+            )
+
+            # 5️⃣ Tag metadata
+            client.set_model_version_tag(
+                name=Registered_model_name,
+                version=new_version,
+                key="best_val_accuracy",
+                value=str(best_acc)
+            )
+            client.set_model_version_tag(
+                name=Registered_model_name,
+                version=new_version,
+                key="best_epoch",
+                value=str(global_epoch)
+            )
+
+            mlflow.log_metric("best_val_accuracy", best_acc)
+            mlflow.set_tag("best_epoch", global_epoch)
 
         cm=confusion_matrix(labels_list,predicted_list)
         disp=ConfusionMatrixDisplay(confusion_matrix=cm)
@@ -95,7 +218,14 @@ def model_inference(model,train_loader,val_loader,epochs,optimizer,criterion,bes
 
         print(classification_report(labels_list,predicted_list))
 
-    return train_accuracy,val_accuracy
+    with open(model_dict_path, "w") as f:
+        json.dump(model_accuracy_dict, f, indent=4)
+
+    mlflow.log_artifact(model_dict_path)
+
+    mlflow.end_run()
+
+    return model_accuracy_dict
 
 def accuracy_plot(accuaracy_dict):
 
